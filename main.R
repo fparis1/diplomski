@@ -14,7 +14,114 @@ library(future.apply)
 # Set up parallel processing (multisession works on most platforms)
 plan(multisession)
 
-# ----- Helper Function: Fetch Track Data -----
+# --------------------------------------------------------------------
+# Helper funkcije za izračun obilježja putanje
+
+# Funkcija za računanje detalja fraktalne dimenzije korištenjem metode "divider" (linijski postupak)
+compute_fractal_dimension_details <- function(track) {
+  n <- nrow(track)
+  if(n < 3) return(list(dimension = NA, eps_values = NA, L_eps = NA))
+  
+  # Izračun ukupne duljine putanje (suma udaljenosti između susjednih točaka)
+  total_length <- sum(sapply(2:n, function(i) geosphere::distHaversine(
+    c(track$longitude[i-1], track$latitude[i-1]),
+    c(track$longitude[i], track$latitude[i])
+  )))
+  
+  if(total_length < 1000) return(list(dimension = NA, eps_values = NA, L_eps = NA))
+  
+  # Definiranje raspona mjerilaca (epsilon) – koristimo logaritamski razmak
+  min_eps <- 50      # minimalna vrijednost u metrima
+  max_eps <- total_length / 2
+  eps_values <- exp(seq(log(min_eps), log(max_eps), length.out = 10))
+  
+  L_eps <- numeric(length(eps_values))
+  
+  # Za svaki epsilon, "prošetaj" putanjom i broj koraka koji prelaze epsilon
+  for(j in seq_along(eps_values)){
+    eps <- eps_values[j]
+    count <- 0
+    cumulative <- 0
+    for(i in 2:n) {
+      d <- geosphere::distHaversine(
+        c(track$longitude[i-1], track$latitude[i-1]),
+        c(track$longitude[i], track$latitude[i])
+      )
+      cumulative <- cumulative + d
+      if(cumulative >= eps) {
+        count <- count + 1
+        cumulative <- 0
+      }
+    }
+    L_eps[j] <- count * eps
+  }
+  
+  valid <- L_eps > 0
+  if(sum(valid) < 2) return(list(dimension = NA, eps_values = eps_values, L_eps = L_eps))
+  fit <- lm(log(L_eps[valid]) ~ log(eps_values[valid]))
+  slope <- coef(fit)[2]
+  # Prema formuli: log(L(eps)) = const + (1-D)*log(eps)  ⟹ D = 1 - slope
+  fractal_dim <- 1 - slope
+  
+  return(list(dimension = fractal_dim, eps_values = eps_values, L_eps = L_eps))
+}
+
+# Pojednostavljena funkcija koja vraća samo fraktalnu dimenziju
+compute_fractal_dimension <- function(track) {
+  details <- compute_fractal_dimension_details(track)
+  return(details$dimension)
+}
+
+# Funkcija za račun statističkih obilježja putanje zrakoplova
+compute_metrics <- function(track) {
+  # Osiguravamo da su podaci sortirani po vremenu
+  track <- track[order(track$time), ]
+  
+  # Trajanje putovanja (u sekundama)
+  duration <- as.numeric(max(track$time) - min(track$time))
+  
+  # Ukupna duljina putanje (suma udaljenosti između susjednih točaka u metrima)
+  total_length <- sum(sapply(2:nrow(track), function(i) {
+    geosphere::distHaversine(
+      c(track$longitude[i-1], track$latitude[i-1]),
+      c(track$longitude[i], track$latitude[i])
+    )
+  }))
+  
+  # Pravocrtnost: omjer udaljenosti "ravne linije" (između prve i zadnje točke) i ukupne duljine putanje
+  straight_distance <- geosphere::distHaversine(
+    c(track$longitude[1], track$latitude[1]),
+    c(track$longitude[nrow(track)], track$latitude[nrow(track)])
+  )
+  straightness <- ifelse(total_length > 0, straight_distance / total_length, NA)
+  
+  # Srednja brzina gibanja (u m/s)
+  mean_velocity <- ifelse(duration > 0, total_length / duration, NA)
+  
+  # Difuzijska udaljenost: RMS udaljenost svih točaka od početne točke
+  distances_from_start <- sapply(1:nrow(track), function(i) {
+    geosphere::distHaversine(
+      c(track$longitude[1], track$latitude[1]),
+      c(track$longitude[i], track$latitude[i])
+    )
+  })
+  diffusion_distance <- sqrt(mean(distances_from_start^2))
+  
+  # Fraktalna dimenzija
+  fd_details <- compute_fractal_dimension_details(track)
+  fractal_dim <- fd_details$dimension
+  
+  # Sastavljamo rezultat kao data.frame
+  metrics <- data.frame(
+    Metric = c("Difuzijska udaljenost (m)", "Pravocrtnost", "Trajanje (s)", "Srednja brzina (m/s)", "Fraktalna dimenzija"),
+    Value = c(diffusion_distance, straightness, duration, mean_velocity, fractal_dim)
+  )
+  return(metrics)
+}
+
+# --------------------------------------------------------------------
+# Funkcije za dohvaćanje podataka
+
 get_track_data <- function(icao24, time, username = NULL, password = NULL) {
   base_url <- "https://opensky-network.org/api/tracks/all"
   response <- GET(base_url, 
@@ -27,15 +134,12 @@ get_track_data <- function(icao24, time, username = NULL, password = NULL) {
   return(track_data)
 }
 
-# ----- Modified Function for Flight Retrieval -----
-# Fetches flights from the "flights/departure" endpoint for the given departure airport and time window.
 get_flight_data <- function(departure_airport, flight_datetime, username = NULL, password = NULL) {
   base_url <- "https://opensky-network.org/api/flights/departure"
-  # Define the time window: 30 minutes before and after the given time.
+  # Definiramo vremenski prozor: 30 minuta prije i poslije zadanog vremena.
   begin_time <- as.numeric(flight_datetime) - 1800
   end_time <- as.numeric(flight_datetime) + 1800
   
-  # Build the full request URL with query parameters for console output.
   full_url <- httr::modify_url(base_url, query = list(
     airport = departure_airport,
     begin = begin_time,
@@ -58,7 +162,6 @@ get_flight_data <- function(departure_airport, flight_datetime, username = NULL,
     if (length(flights) == 0) {
       stop("Nema podataka za zadane parametre.")
     }
-    # Convert to data frame and remove any rows containing null (NA) values.
     flights <- as.data.frame(flights)
     flights <- na.omit(flights)
     return(flights)
@@ -68,7 +171,6 @@ get_flight_data <- function(departure_airport, flight_datetime, username = NULL,
   }
 }
 
-# ----- Function for Formatting Flight Data (unchanged) -----
 format_flight_data <- function(flights) {
   flights <- flights %>% 
     left_join(airport_data, by = c("estDepartureAirport" = "icao_code")) %>% 
@@ -130,7 +232,9 @@ format_flight_data <- function(flights) {
   return(flights)
 }
 
-# ----- Load Static Data (airports, airlines) -----
+# --------------------------------------------------------------------
+# Učitavanje statičkih podataka (airports, airlines)
+
 airport_data <- read.csv(file.path(getwd(), "airports.csv"), stringsAsFactors = FALSE)
 colnames(airport_data) <- c("id", "name", "city", "country", "iata_code", 
                             "icao_code", "latitude", "longitude", "altitude", 
@@ -138,47 +242,27 @@ colnames(airport_data) <- c("id", "name", "city", "country", "iata_code",
                             "type", "source")
 airport_data <- airport_data[, c("name", "city", "icao_code", "latitude", "longitude")]
 
-# Load airlines.csv – assuming the file has headers
 airlines_data <- read.csv(file.path(getwd(), "airlines.csv"), header = TRUE, stringsAsFactors = FALSE)
 colnames(airlines_data) <- c("id", "name", "alias", "IATA", "ICAO", "callsign", "country", "active")
-# Use only the "ICAO" and "name" columns
 airlines_data <- airlines_data[, c("ICAO", "name")]
 
+# --------------------------------------------------------------------
+# Definicija grafičkog korisničkog sučelja (UI)
 
-airports_full_names <- list(
-  "KATL" = "Hartsfield-Jackson Atlanta International Airport (Atlanta, USA)",
-  "ZBAA" = "Beijing Capital International Airport (Beijing, China)",
-  "KLAX" = "Los Angeles International Airport (Los Angeles, USA)",
-  "OMDB" = "Dubai International Airport (Dubai, UAE)",
-  "RJTT" = "Tokyo Haneda Airport (Tokyo, Japan)",
-  "KORD" = "O'Hare International Airport (Chicago, USA)",
-  "EGLL" = "London Heathrow Airport (London, UK)",
-  "ZSPD" = "Shanghai Pudong International Airport (Shanghai, China)",
-  "LFPG" = "Charles de Gaulle Airport (Paris, France)"
-)
-
-# ----- Define Shiny UI -----
-# Note: The "Analiza putanje" tab has been removed.
 ui <- navbarPage(
   "Dohvat i analiza letova",
-  useShinyjs(),
+  
+  # Prvi tab – dohvat podataka, prikaz karte i tablice
   tabPanel("Podaci",
            sidebarLayout(
              sidebarPanel(
-               # Input for flight number (optional)
                textInput("flight_number", "Broj leta (opcionalno):", value = ""),
-               
-               # Text input for airline search and dynamic select input for filtered results
                textInput("airline_search", "Pretraži aviokompanije:", value = ""),
                uiOutput("airline_select_ui"),
-               
                textInput("airport_search", "Pretraži zračne luke:", value = ""),
                uiOutput("airport_select_ui"),
-               
-               # Date and time inputs for flight
                dateInput("flight_date", "Datum leta:", value = Sys.Date(), max = Sys.Date()),
                textInput("departure_time", "Sat polijetanja (HH:MM):", value = "12:00"),
-               
                textInput("username", "Korisničko ime (opcionalno):", value = "filipparis11"),
                passwordInput("password", "Lozinka (opcionalno):", value = "filipparis11"),
                actionButton("fetch", "Dohvati podatke"),
@@ -193,18 +277,37 @@ ui <- navbarPage(
                textOutput("status_message")
              )
            )
+  ),
+  
+  # Drugi tab – analiza odabranog leta
+  tabPanel("Analiza leta",
+           fluidPage(
+             h3("Analiza odabranog leta"),
+             textOutput("selected_flight_info"),
+             br(),
+             h4("Statistička obilježja putanje"),
+             tableOutput("metrics_table"),
+             br(),
+             h4("Analiza fraktalne dimenzije"),
+             plotOutput("fractal_plot"),
+             br(),
+             h4("Putanja odabranog leta"),
+             leafletOutput("selected_map", height = "500px")
+           )
   )
 )
 
-# ----- Define Shiny Server -----
+# --------------------------------------------------------------------
+# Definicija server logike
+
 server <- function(input, output, session) {
   rv <- reactiveValues(data = NULL)
   
   disable("downloadData")
   
-  # Reactive filtering of airlines_data based on the airline search text.
+  # Filtriranje aviokompanija na temelju unesenog pojma
   filtered_airlines <- reactive({
-    if (nchar(input$airline_search) == 0) {
+    if(nchar(input$airline_search) == 0) {
       airlines_data
     } else {
       search_term <- tolower(input$airline_search)
@@ -212,15 +315,14 @@ server <- function(input, output, session) {
     }
   })
   
-  # Dynamically generate selectInput for airline selection based on the filtered results.
   output$airline_select_ui <- renderUI({
     choices <- setNames(filtered_airlines()$ICAO, filtered_airlines()$name)
     selectInput("airline", "Odaberi aviokompaniju:", choices = choices)
   })
   
-  ## Reactive filtering of airports_data based on the search text.
+  # Filtriranje zračnih luka prema pretraživanju
   filtered_airports <- reactive({
-    if (nchar(input$airport_search) == 0) {
+    if(nchar(input$airport_search) == 0) {
       airport_data
     } else {
       search_term <- tolower(input$airport_search)
@@ -229,7 +331,6 @@ server <- function(input, output, session) {
     }
   })
   
-  # Dynamically generate selectInput for airport selection with name and city.
   output$airport_select_ui <- renderUI({
     choices <- setNames(filtered_airports()$icao_code, 
                         paste0(filtered_airports()$name, " (", filtered_airports()$city, ")"))
@@ -248,17 +349,15 @@ server <- function(input, output, session) {
   observeEvent(input$fetch, {
     output$status_message <- renderText({ "Dohvaćam podatke..." })
     
-    # Combine flight date and departure time into one datetime.
     flight_datetime <- as.POSIXct(paste(input$flight_date, input$departure_time),
                                   format = "%Y-%m-%d %H:%M",
                                   tz = "UTC")
-    if (is.na(flight_datetime)) {
+    if(is.na(flight_datetime)) {
       output$status_message <- renderText({ "Neispravan format vremena. Koristite HH:MM." })
       return()
     }
     
     tryCatch({
-      # Fetch flight data from the API using the specified departure airport and time window.
       flights <- get_flight_data(
         departure_airport = input$airport,
         flight_datetime = flight_datetime,
@@ -270,35 +369,28 @@ server <- function(input, output, session) {
         mutate(trim_callsign = trimws(callsign)) %>%
         mutate(airline_prefix = sub("^(\\D+).*", "\\1", trim_callsign))
       
-      # If a flight number is provided, filter by it; otherwise skip this filter.
-      if (nchar(input$flight_number) > 0) {
+      if(nchar(input$flight_number) > 0) {
         flights <- flights %>% filter(trim_callsign == input$flight_number)
       }
       
       flights <- flights %>% filter(airline_prefix == input$airline)
       
-      if (nrow(flights) == 0) {
+      if(nrow(flights) == 0) {
         stop("Nema podataka za zadane parametre: provjerite broj leta (ako je uneseno), aviokompaniju, zračnu luku polaska, datum i vrijeme polijetanja.")
       }
       
-      # Format the flight data.
       formatted_flights <- format_flight_data(flights)
       
-      # Create local copies of needed variables for the parallel workers.
       user <- input$username
       pass <- input$password
       total_requests <- nrow(formatted_flights)
       
-      # Execute the track requests in parallel with progress messages.
       track_results <- future_lapply(seq_len(total_requests), function(i, flights, user, pass, total_requests) {
-        # Load required libraries in the worker
         library(httr)
         library(jsonlite)
         library(lubridate)
         
-        # Print progress to the terminal (each worker prints its own message)
         print(paste("Fetching track data request", i, "of", total_requests))
-        
         flight <- flights[i, ]
         t1 <- as.numeric(as.POSIXct(flight$`Prvi put detektirano`, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
         t2 <- as.numeric(as.POSIXct(flight$`Posljednji put detektirano`, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"))
@@ -313,8 +405,8 @@ server <- function(input, output, session) {
           )
         }, error = function(e) NULL)
         
-        if (!is.null(track_data) && !is.null(track_data$path) && length(track_data$path) > 0) {
-          if (is.matrix(track_data$path)) {
+        if(!is.null(track_data) && !is.null(track_data$path) && length(track_data$path) > 0) {
+          if(is.matrix(track_data$path)) {
             track_df <- as.data.frame(track_data$path)
           } else {
             track_df <- as.data.frame(do.call(rbind, track_data$path))
@@ -333,7 +425,24 @@ server <- function(input, output, session) {
       
       formatted_flights$track <- track_results
       
-      rv$data <- formatted_flights
+      # Filtriranje letova: isključiti ako nema track podataka ili zadnja točka nije dovoljno blizu dolazne luke.
+      valid_flights <- formatted_flights %>%
+        rowwise() %>%
+        filter({
+          tol <- 3000  # tolerancija u metrima (mijenjajte po potrebi)
+          if(is.null(track) || nrow(track) == 0) {
+            FALSE
+          } else {
+            arrival_lon <- as.numeric(`Dužina zračne luke dolaska`)
+            arrival_lat <- as.numeric(`Širina zračne luke dolaska`)
+            last_point <- tail(track, 1)
+            d <- geosphere::distHaversine(c(last_point$longitude, last_point$latitude),
+                                          c(arrival_lon, arrival_lat))
+            d <= tol
+          }
+        }) %>% ungroup()
+      
+      rv$data <- valid_flights
       
       output$status_message <- renderText({ "Podaci uspješno dohvaćeni!" })
       enable("downloadData")
@@ -352,7 +461,6 @@ server <- function(input, output, session) {
   
   output$map <- renderLeaflet({
     req(rv$data)
-    # Start with base map and add markers for departure and arrival airports
     formatted_flights <- rv$data %>%
       mutate(
         `Širina zračne luke polaska` = as.numeric(`Širina zračne luke polaska`),
@@ -387,14 +495,99 @@ server <- function(input, output, session) {
         popup = ~paste("<strong>Zračna luka dolaska:</strong>", `Zračna luka dolaska`)
       )
     
-    # For each flight, if actual track data is available, draw the polyline.
-    for (i in 1:nrow(formatted_flights)) {
+    for(i in 1:nrow(formatted_flights)) {
       track_df <- formatted_flights$track[[i]]
       if(!is.null(track_df)) {
         coords <- as.matrix(track_df[, c("longitude", "latitude")])
         map <- map %>% addPolylines(lng = coords[,1], lat = coords[,2], color = "purple", weight = 3)
       }
     }
+    map
+  })
+  
+  # ----------------------------------------------------------------
+  # Reaktivne varijable i izlazi za analizu odabranog leta
+  
+  selected_flight <- reactive({
+    req(rv$data)
+    s <- input$flight_table_rows_selected
+    if(length(s) == 0) return(NULL)
+    rv$data[s, ]
+  })
+  
+  # Iz teksta selektiranog leta, ispisujemo neke osnovne informacije
+  output$selected_flight_info <- renderText({
+    sf <- selected_flight()
+    if(is.null(sf)) {
+      "Nije odabran niti jedan let."
+    } else {
+      paste("Odabrani let:", sf$`Pozivni znak leta`, "od", sf$`Zračna luka polaska`, "do", sf$`Zračna luka dolaska`,
+            "\nPrvi put detektirano:", sf$`Prvi put detektirano`, " | Posljednji put detektirano:", sf$`Posljednji put detektirano`)
+    }
+  })
+  
+  # Reaktivno računanje statističkih obilježja za odabrani let
+  selected_metrics <- reactive({
+    sf <- selected_flight()
+    if(is.null(sf)) return(NULL)
+    track <- sf$track[[1]]
+    if(is.null(track) || nrow(track) == 0) return(NULL)
+    compute_metrics(track)
+  })
+  
+  output$metrics_table <- renderTable({
+    req(selected_metrics())
+    selected_metrics()
+  })
+  
+  # Reaktivno dobivanje podataka za analizu fraktalne dimenzije
+  selected_fractal_details <- reactive({
+    sf <- selected_flight()
+    if(is.null(sf)) return(NULL)
+    track <- sf$track[[1]]
+    if(is.null(track) || nrow(track) == 0) return(NULL)
+    compute_fractal_dimension_details(track)
+  })
+  
+  # Grafički prikaz analize fraktalne dimenzije: log-log dijagram L(eps) ovisno o eps
+  output$fractal_plot <- renderPlot({
+    fd <- selected_fractal_details()
+    req(fd)
+    valid <- !is.na(fd$eps_values) & !is.na(fd$L_eps) & (fd$L_eps > 0)
+    if(sum(valid) < 2) {
+      plot.new()
+      text(0.5, 0.5, "Nema dovoljno podataka za analizu fraktalne dimenzije.")
+    } else {
+      plot(log(fd$eps_values[valid]), log(fd$L_eps[valid]),
+           xlab = "log(eps)", ylab = "log(L(eps))", main = "Analiza fraktalne dimenzije", pch = 16)
+      fit <- lm(log(fd$L_eps[valid]) ~ log(fd$eps_values[valid]))
+      abline(fit, col = "red", lwd = 2)
+      legend("bottomright", legend = paste("Fraktalna dimenzija =", round(1 - coef(fit)[2], 3)),
+             bty = "n")
+    }
+  })
+  
+  # Posebna karta za odabrani let: prikazuje samo putanju odabranog leta
+  output$selected_map <- renderLeaflet({
+    sf <- selected_flight()
+    req(sf)
+    track <- sf$track[[1]]
+    if(is.null(track) || nrow(track) == 0) return(NULL)
+    
+    # Početna i krajnja točka
+    departure <- c(as.numeric(sf$`Dužina zračne luke polaska`), as.numeric(sf$`Širina zračne luke polaska`))
+    arrival <- c(as.numeric(sf$`Dužina zračne luke dolaska`), as.numeric(sf$`Širina zračne luke dolaska`))
+    
+    map <- leaflet() %>% addTiles() %>%
+      addCircleMarkers(lng = departure[1], lat = departure[2],
+                       color = "blue", radius = 6,
+                       popup = paste("<strong>Zračna luka polaska:</strong>", sf$`Zračna luka polaska`)) %>%
+      addCircleMarkers(lng = arrival[1], lat = arrival[2],
+                       color = "red", radius = 6,
+                       popup = paste("<strong>Zračna luka dolaska:</strong>", sf$`Zračna luka dolaska`))
+    
+    coords <- as.matrix(track[, c("longitude", "latitude")])
+    map <- map %>% addPolylines(lng = coords[,1], lat = coords[,2], color = "purple", weight = 3)
     map
   })
 }
