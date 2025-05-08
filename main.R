@@ -10,6 +10,8 @@ library(tidyr)
 library(shinyjs)
 library(future)
 library(future.apply)
+library(shinycssloaders)
+library(promises)
 
 # Set up parallel processing (multisession works on most platforms)
 plan(multisession)
@@ -251,16 +253,31 @@ airlines_data <- airlines_data[, c("ICAO", "name")]
 
 ui <- navbarPage(
   "Dohvat i analiza letova",
-  
+  useShinyjs(),
   # Prvi tab – dohvat podataka, prikaz karte i tablice
   tabPanel("Podaci",
            sidebarLayout(
              sidebarPanel(
                textInput("flight_number", "Broj leta (opcionalno):", value = ""),
-               textInput("airline_search", "Pretraži aviokompanije:", value = ""),
-               uiOutput("airline_select_ui"),
-               textInput("airport_search", "Pretraži zračne luke:", value = ""),
-               uiOutput("airport_select_ui"),
+               # Removed separate search fields; using selectize with built-in search
+               selectizeInput(
+                 inputId = "airline",
+                 label   = "Odaberi aviokompaniju:",
+                 choices = NULL,
+                 options = list(
+                   placeholder = 'Počni tipkati za pretraživanje…',
+                   allowEmptyOption = FALSE),
+                 selected = NULL
+               ),
+               selectizeInput(
+                 inputId = "airport",
+                 label   = "Odaberi zračnu luku:",
+                 choices = NULL,
+                 options = list(
+                   placeholder = 'Počni tipkati za pretraživanje…',
+                   allowEmptyOption = FALSE),
+                 selected = NULL
+               ),
                dateInput("flight_date", "Datum leta:", value = Sys.Date(), max = Sys.Date()),
                textInput("departure_time", "Sat polijetanja (HH:MM):", value = "12:00"),
                textInput("username", "Korisničko ime (opcionalno):", value = "filipparis11"),
@@ -271,7 +288,31 @@ ui <- navbarPage(
              ),
              mainPanel(
                tabsetPanel(
-                 tabPanel("Karta letova", leafletOutput("map", height = "600px")),
+                 tabPanel("Karta letova",
+                          hidden(
+                            div(
+                              id = "map-spinner",
+                              style = "
+                             position:absolute;
+                             top:0; left:0;
+                             width:100%; height:100%;
+                             background: rgba(255,255,255,0.7);
+                             z-index:1000;
+                             display:flex;
+                             align-items:center;
+                             justify-content:center;
+                             ",
+                              icon("spinner", class = "fa-spin fa-3x fa-fw")
+                            )
+                          ),
+                          # map container hidden until data arrives
+                            hidden(
+                              div(
+                                id = "map-container", style = "position:relative; height:600px;",
+                                leafletOutput("map", height = "600px")
+                                )
+                              )
+                          ),
                  tabPanel("Tablica podataka", DTOutput("flight_table"))
                ),
                textOutput("status_message")
@@ -292,7 +333,11 @@ ui <- navbarPage(
              plotOutput("fractal_plot"),
              br(),
              h4("Putanja odabranog leta"),
-             leafletOutput("selected_map", height = "500px")
+             withSpinner(
+               leafletOutput("selected_map", height = "500px"),
+               type  = 4,
+               color = "#2C3E50"
+               )
            )
   )
 )
@@ -305,49 +350,57 @@ server <- function(input, output, session) {
   
   disable("downloadData")
   
-  # Filtriranje aviokompanija na temelju unesenog pojma
-  filtered_airlines <- reactive({
-    if(nchar(input$airline_search) == 0) {
-      airlines_data
-    } else {
-      search_term <- tolower(input$airline_search)
-      airlines_data[grepl(search_term, tolower(airlines_data$name)), ]
-    }
-  })
+  updateSelectizeInput(
+    session,
+    "airline",
+    choices = setNames(airlines_data$ICAO, airlines_data$name),
+    selected = character(0),
+    server = TRUE
+  )
+  updateSelectizeInput(
+    session,
+    "airport",
+    choices = setNames(
+      airport_data$icao_code,
+      paste0(airport_data$name, " (", airport_data$city, ")")
+    ),
+    selected = character(0),
+    server = TRUE
+  )
   
-  output$airline_select_ui <- renderUI({
-    choices <- setNames(filtered_airlines()$ICAO, filtered_airlines()$name)
-    selectInput("airline", "Odaberi aviokompaniju:", choices = choices)
-  })
-  
-  # Filtriranje zračnih luka prema pretraživanju
-  filtered_airports <- reactive({
-    if(nchar(input$airport_search) == 0) {
-      airport_data
-    } else {
-      search_term <- tolower(input$airport_search)
-      airport_data[grepl(search_term, tolower(airport_data$name)) | 
-                     grepl(search_term, tolower(airport_data$city)), ]
-    }
-  })
-  
-  output$airport_select_ui <- renderUI({
-    choices <- setNames(filtered_airports()$icao_code, 
-                        paste0(filtered_airports()$name, " (", filtered_airports()$city, ")"))
-    selectInput("airport", "Odaberi zračnu luku:", choices = choices)
-  })
-  
+  # Download handler: include track coordinates for each flight when exporting
   output$downloadData <- downloadHandler(
     filename = function() {
       paste("flight_data_", format(Sys.time(), "%Y-%m-%d_%H-%M-%S"), ".csv", sep = "")
     },
     content = function(file) {
-      write.csv(rv$data, file, row.names = FALSE)
+      # Prepare export: include all columns plus a collapsed coordinate string
+      export_df <- rv$data %>%
+        rowwise() %>%
+        mutate(
+          track_coords = if (!is.null(track)) {
+            paste0(
+              "[",
+              paste(paste(track$latitude, track$longitude, sep = ","), collapse = ";"),
+              "]"
+            )
+          } else {
+            NA_character_
+          }
+        ) %>%
+        ungroup() %>%
+        select(-track)
+      
+      write.csv(export_df, file, row.names = FALSE)
     }
   )
   
   observeEvent(input$fetch, {
-    output$status_message <- renderText({ "Dohvaćam podatke..." })
+    # clear old notifications and start departure-phase spinner
+    removeNotification(id = "notif_dep"); removeNotification(id = "notif_trk")
+    show("map-spinner")
+    showNotification("Dohvaćam podatke o polascima…", id = "notif_dep", type = "message", duration = NULL)
+    output$status_message <- renderText({ "Dohvaćam podatke o polascima…" })
     
     flight_datetime <- as.POSIXct(paste(input$flight_date, input$departure_time),
                                   format = "%Y-%m-%d %H:%M",
@@ -364,6 +417,12 @@ server <- function(input, output, session) {
         username = input$username,
         password = input$password
       )
+      
+      # departure-phase done: hide spinner, notify success
+       removeNotification(id = "notif_dep")
+       hide("map-spinner")
+       showNotification("Podaci o polascima dohvaćeni!", type = "message", duration = 2)
+       output$status_message <- renderText({ "Podaci o polascima dohvaćeni, dohvaćam tragove…" })
       
       flights <- flights %>%
         mutate(trim_callsign = trimws(callsign)) %>%
@@ -385,6 +444,9 @@ server <- function(input, output, session) {
       pass <- input$password
       total_requests <- nrow(formatted_flights)
       
+      showNotification("Dohvaćam podatke o tragovima…", id = "notif_trk", type = "message", duration = NULL)
+      # track-phase spinner
+      show("map-spinner")
       track_results <- future_lapply(seq_len(total_requests), function(i, flights, user, pass, total_requests) {
         library(httr)
         library(jsonlite)
@@ -444,10 +506,17 @@ server <- function(input, output, session) {
       
       rv$data <- valid_flights
       
+      # track-phase done: hide spinner, notify success
+      removeNotification(id = "notif_trk")
+      hide("map-spinner")
+      show("map-container")
+      showNotification("Podaci o tragovima uspješno dohvaćeni!", type = "message", duration = 2)
       output$status_message <- renderText({ "Podaci uspješno dohvaćeni!" })
       enable("downloadData")
       
     }, error = function(e) {
+      hide("map-spinner")
+      hide("map-container")
       output$status_message <- renderText({ paste("Greška prilikom dohvaćanja podataka:", e$message) })
     })
   })
@@ -460,49 +529,61 @@ server <- function(input, output, session) {
   })
   
   output$map <- renderLeaflet({
-    req(rv$data)
-    formatted_flights <- rv$data %>%
-      mutate(
-        `Širina zračne luke polaska` = as.numeric(`Širina zračne luke polaska`),
-        `Dužina zračne luke polaska` = as.numeric(`Dužina zračne luke polaska`),
-        `Širina zračne luke dolaska` = as.numeric(`Širina zračne luke dolaska`),
-        `Dužina zračne luke dolaska` = as.numeric(`Dužina zračne luke dolaska`)
-      ) %>%
+    # Base map with world‐wrapping enabled
+    m <- leaflet(options = leafletOptions(worldCopyJump = TRUE)) %>% 
+      addTiles()
+    
+    # If there's no flight data, just return the empty map
+    if (is.null(rv$data) || nrow(rv$data) == 0) {
+      return(m)
+    }
+    
+    # Coerce the airport coords to numeric
+    df <- rv$data %>%
+      mutate_at(vars(
+        `Širina zračne luke polaska`,
+        `Dužina zračne luke polaska`,
+        `Širina zračne luke dolaska`,
+        `Dužina zračne luke dolaska`
+      ), as.numeric) %>%
       filter(
         !is.na(`Širina zračne luke polaska`),
         !is.na(`Dužina zračne luke polaska`),
         !is.na(`Širina zračne luke dolaska`),
-        !is.na(`Dužina zračne luke dolaska`),
-        `Širina zračne luke polaska` >= -90 & `Širina zračne luke polaska` <= 90,
-        `Dužina zračne luke polaska` >= -180 & `Dužina zračne luke polaska` <= 180,
-        `Širina zračne luke dolaska` >= -90 & `Širina zračne luke dolaska` <= 90,
-        `Dužina zračne luke dolaska` >= -180 & `Dužina zračne luke dolaska` <= 180,
-        `Zračna luka polaska` != `Zračna luka dolaska`
+        !is.na(`Dužina zračne luke dolaska`)
       )
     
-    map <- leaflet(data = formatted_flights) %>%
-      addTiles() %>%
+    # Add departure (blue) and arrival (red) markers
+    m <- m %>%
       addCircleMarkers(
-        lng = ~`Dužina zračne luke polaska`,
-        lat = ~`Širina zračne luke polaska`,
-        color = "blue", radius = 5,
-        popup = ~paste("<strong>Zračna luka polaska:</strong>", `Zračna luka polaska`)
+        lng     = df$`Dužina zračne luke polaska`,
+        lat     = df$`Širina zračne luke polaska`,
+        color   = "blue", radius = 5,
+        popup   = paste0("<strong>Polazak:</strong> ", df$`Zračna luka polaska`)
       ) %>%
       addCircleMarkers(
-        lng = ~`Dužina zračne luke dolaska`,
-        lat = ~`Širina zračne luke dolaska`,
-        color = "red", radius = 5,
-        popup = ~paste("<strong>Zračna luka dolaska:</strong>", `Zračna luka dolaska`)
+        lng     = df$`Dužina zračne luke dolaska`,
+        lat     = df$`Širina zračne luke dolaska`,
+        color   = "red",  radius = 5,
+        popup   = paste0("<strong>Dolazak:</strong> ", df$`Zračna luka dolaska`)
       )
     
-    for(i in 1:nrow(formatted_flights)) {
-      track_df <- formatted_flights$track[[i]]
-      if(!is.null(track_df)) {
-        coords <- as.matrix(track_df[, c("longitude", "latitude")])
-        map <- map %>% addPolylines(lng = coords[,1], lat = coords[,2], color = "purple", weight = 3)
+    # Draw each track (noClip = TRUE so it spans map edges)
+    for (i in seq_len(nrow(df))) {
+      trk <- df$track[[i]]
+      if (is.data.frame(trk) && nrow(trk) >= 2) {
+        m <- m %>%
+          addPolylines(
+            lng     = trk$longitude,
+            lat     = trk$latitude,
+            color   = "purple",
+            weight  = 3,
+            options = pathOptions(noClip = TRUE)
+          )
       }
     }
-    map
+    
+    m
   })
   
   # ----------------------------------------------------------------
