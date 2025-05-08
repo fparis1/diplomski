@@ -313,7 +313,32 @@ ui <- navbarPage(
                                 )
                               )
                           ),
-                 tabPanel("Tablica podataka", DTOutput("flight_table"))
+                 tabPanel("Tablica podataka",
+                          # spinner overlay (initially hidden)
+                          hidden(
+                            div(
+                              id = "table-spinner",
+                              style = "
+                               position: absolute;
+                               top: 0; left: 0;
+                               width: 100%; height: 100%;
+                               background: rgba(255,255,255,0.7);
+                               z-index: 1000;
+                               display: flex;
+                               align-items: center;
+                               justify-content: center;
+                             ",
+                              icon("spinner", class = "fa-spin fa-3x fa-fw")
+                              )
+                            ),
+                          # actual table container (initially hidden)
+                            hidden(
+                              div(
+                                id = "table-container",
+                                 DTOutput("flight_table")
+                                )
+                              )
+                          )
                ),
                textOutput("status_message")
              )
@@ -347,6 +372,8 @@ ui <- navbarPage(
 
 server <- function(input, output, session) {
   rv <- reactiveValues(data = NULL)
+  
+  flight_table_proxy <- dataTableProxy("flight_table")
   
   disable("downloadData")
   
@@ -398,7 +425,12 @@ server <- function(input, output, session) {
   observeEvent(input$fetch, {
     # clear old notifications and start departure-phase spinner
     removeNotification(id = "notif_dep"); removeNotification(id = "notif_trk")
+    #–– map spinners
+    hide("map-container")
     show("map-spinner")
+    #–– table spinners
+    hide("table-container")
+    show("table-spinner")
     showNotification("Dohvaćam podatke o polascima…", id = "notif_dep", type = "message", duration = NULL)
     output$status_message <- renderText({ "Dohvaćam podatke o polascima…" })
     
@@ -506,10 +538,19 @@ server <- function(input, output, session) {
       
       rv$data <- valid_flights
       
+      # and *then* update the existing DT via the proxy:
+      replaceData(
+        flight_table_proxy,
+        rv$data %>% select(-track),
+        resetPaging = TRUE
+      )
+      
       # track-phase done: hide spinner, notify success
       removeNotification(id = "notif_trk")
       hide("map-spinner")
       show("map-container")
+      hide("table-spinner")
+      show("table-container")
       showNotification("Podaci o tragovima uspješno dohvaćeni!", type = "message", duration = 2)
       output$status_message <- renderText({ "Podaci uspješno dohvaćeni!" })
       enable("downloadData")
@@ -517,6 +558,8 @@ server <- function(input, output, session) {
     }, error = function(e) {
       hide("map-spinner")
       hide("map-container")
+      hide("table-spinner")
+      hide("table-container")
       output$status_message <- renderText({ paste("Greška prilikom dohvaćanja podataka:", e$message) })
     })
   })
