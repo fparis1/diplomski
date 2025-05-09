@@ -13,7 +13,7 @@ library(future.apply)
 library(shinycssloaders)
 library(promises)
 
-# Set up parallel processing (multisession works on most platforms)
+# Omogućavanje paralelnog izvršavanja zahtjeva
 plan(multisession)
 
 # --------------------------------------------------------------------
@@ -32,7 +32,7 @@ compute_fractal_dimension_details <- function(track) {
   
   if(total_length < 1000) return(list(dimension = NA, eps_values = NA, L_eps = NA))
   
-  # Definiranje raspona mjerilaca (epsilon) – koristimo logaritamski razmak
+  # Definiranje raspona mjerilaca (epsilon) – koristi se logaritamski razmak
   min_eps <- 50      # minimalna vrijednost u metrima
   max_eps <- total_length / 2
   eps_values <- exp(seq(log(min_eps), log(max_eps), length.out = 10))
@@ -113,7 +113,7 @@ compute_metrics <- function(track) {
   fd_details <- compute_fractal_dimension_details(track)
   fractal_dim <- fd_details$dimension
   
-  # Sastavljamo rezultat kao data.frame
+  # Sastavljanje rezultat kao data.frame
   metrics <- data.frame(
     Metric = c("Difuzijska udaljenost (m)", "Pravocrtnost", "Trajanje (s)", "Srednja brzina (m/s)", "Fraktalna dimenzija"),
     Value = c(diffusion_distance, straightness, duration, mean_velocity, fractal_dim)
@@ -395,13 +395,13 @@ server <- function(input, output, session) {
     server = TRUE
   )
   
-  # Download handler: include track coordinates for each flight when exporting
+  # Handler preuzimanja: sadrži koordinate svih letova
   output$downloadData <- downloadHandler(
     filename = function() {
       paste("flight_data_", format(Sys.time(), "%Y-%m-%d_%H-%M-%S"), ".csv", sep = "")
     },
     content = function(file) {
-      # Prepare export: include all columns plus a collapsed coordinate string
+      # Priprema izvoza podataka: sarži sve stupce uključujući listu koordinata
       export_df <- rv$data %>%
         rowwise() %>%
         mutate(
@@ -423,7 +423,7 @@ server <- function(input, output, session) {
   )
   
   observeEvent(input$fetch, {
-    # clear old notifications and start departure-phase spinner
+    # očisti staru obavijest
     removeNotification(id = "notif_dep"); removeNotification(id = "notif_trk")
     #–– map spinners
     hide("map-container")
@@ -450,7 +450,7 @@ server <- function(input, output, session) {
         password = input$password
       )
       
-      # departure-phase done: hide spinner, notify success
+      # prvi zahtjev gotov, sakrij spinner
        removeNotification(id = "notif_dep")
        hide("map-spinner")
        showNotification("Podaci o polascima dohvaćeni!", type = "message", duration = 2)
@@ -477,7 +477,7 @@ server <- function(input, output, session) {
       total_requests <- nrow(formatted_flights)
       
       showNotification("Dohvaćam podatke o tragovima…", id = "notif_trk", type = "message", duration = NULL)
-      # track-phase spinner
+      # spinner za drugu iteraciju zahtjeva
       show("map-spinner")
       track_results <- future_lapply(seq_len(total_requests), function(i, flights, user, pass, total_requests) {
         library(httr)
@@ -538,14 +538,14 @@ server <- function(input, output, session) {
       
       rv$data <- valid_flights
       
-      # and *then* update the existing DT via the proxy:
+      # osvježi DT tablicu preko proxy-a
       replaceData(
         flight_table_proxy,
         rv$data %>% select(-track),
         resetPaging = TRUE
       )
       
-      # track-phase done: hide spinner, notify success
+      # druga iteracija zahtjeva gotova, sakrij spinner, prikaži obavijest
       removeNotification(id = "notif_trk")
       hide("map-spinner")
       show("map-container")
@@ -572,16 +572,15 @@ server <- function(input, output, session) {
   })
   
   output$map <- renderLeaflet({
-    # Base map with world‐wrapping enabled
+    # Omogućuje prelazak granice jedne mape
     m <- leaflet(options = leafletOptions(worldCopyJump = TRUE)) %>% 
       addTiles()
     
-    # If there's no flight data, just return the empty map
     if (is.null(rv$data) || nrow(rv$data) == 0) {
       return(m)
     }
     
-    # Coerce the airport coords to numeric
+    # Prebaci koordinate zračnih luka u numeričke vrijednosti
     df <- rv$data %>%
       mutate_at(vars(
         `Širina zračne luke polaska`,
@@ -596,7 +595,7 @@ server <- function(input, output, session) {
         !is.na(`Dužina zračne luke dolaska`)
       )
     
-    # Add departure (blue) and arrival (red) markers
+    # Dodaj markere za zračne luke polaska i dolaska
     m <- m %>%
       addCircleMarkers(
         lng     = df$`Dužina zračne luke polaska`,
@@ -611,7 +610,7 @@ server <- function(input, output, session) {
         popup   = paste0("<strong>Dolazak:</strong> ", df$`Zračna luka dolaska`)
       )
     
-    # Draw each track (noClip = TRUE so it spans map edges)
+    # Iscrtaj svaki let
     for (i in seq_len(nrow(df))) {
       trk <- df$track[[i]]
       if (is.data.frame(trk) && nrow(trk) >= 2) {
@@ -639,7 +638,7 @@ server <- function(input, output, session) {
     rv$data[s, ]
   })
   
-  # Iz teksta selektiranog leta, ispisujemo neke osnovne informacije
+  # Iz teksta selektiranog leta, ispisuju se osnovne informacije
   output$selected_flight_info <- renderText({
     sf <- selected_flight()
     if(is.null(sf)) {
